@@ -5,14 +5,9 @@ from torch.nn.utils.rnn import pack_padded_sequence
 
 
 class ResidualConv1d(nn.Module):
-    """
-    [新增] 1D 残差卷积块
-    结构: Conv1d -> BN -> ReLU -> Dropout -> Residual Add
-    """
 
     def __init__(self, channels, kernel_size=3, dropout=0.1):
         super(ResidualConv1d, self).__init__()
-        # padding=kernel_size//2 保证输入输出序列长度一致（假设 stride=1）
         self.conv = nn.Conv1d(channels, channels, kernel_size,
                               padding=kernel_size // 2)
         self.bn = nn.BatchNorm1d(channels)
@@ -39,9 +34,6 @@ class HybridMoleculeEncoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.dropout_layer = nn.Dropout(dropout)
 
-        # ==========================
-        # Branch A: LSTM
-        # ==========================
         self.lstm = nn.LSTM(
             input_size=d_model,
             hidden_size=d_model // 2,
@@ -51,12 +43,7 @@ class HybridMoleculeEncoder(nn.Module):
             bidirectional=True
         )
 
-        # ==========================
-        # Branch B: Deep CNN (重构版)
-        # ==========================
 
-        # Layer 1: 多尺度并行卷积 (Multi-scale Stem)
-        # 作用：同时捕捉原子环境(3), 官能团(5), 骨架片段(7)
         self.cnn_kernels = cnn_kernels
         self.stem_convs = nn.ModuleList([
             nn.Conv1d(in_channels=d_model,
@@ -66,21 +53,16 @@ class HybridMoleculeEncoder(nn.Module):
             for k in cnn_kernels
         ])
 
-        # 计算拼接后的维度: cnn_filters * 3 (如果 kernels=[3,5,7])
         self.cnn_feature_dim = cnn_filters * len(cnn_kernels)
 
-        # Layers 2...N: 深度残差堆叠
-        # 作用：组合底层特征，提取高层语义
         self.deep_cnn_layers = nn.ModuleList()
-        # 如果配置的层数大于1，则添加残差层
         for _ in range(cnn_num_layers - 1):
             self.deep_cnn_layers.append(
                 ResidualConv1d(channels=self.cnn_feature_dim,
-                               kernel_size=3,  # 中间层通常用小核堆叠
+                               kernel_size=3, 
                                dropout=dropout)
             )
 
-        # CNN 投影层：将 CNN 最终特征对齐到 d_model
         self.cnn_project = nn.Sequential(
             nn.Linear(self.cnn_feature_dim, d_model),
             nn.BatchNorm1d(d_model),
@@ -88,9 +70,6 @@ class HybridMoleculeEncoder(nn.Module):
             nn.Dropout(dropout)
         )
 
-        # ==========================
-        # Module C: Gated Fusion
-        # ==========================
         self.gate_net = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.Sigmoid()
@@ -104,48 +83,34 @@ class HybridMoleculeEncoder(nn.Module):
         x = self.embedding(src)
         x = self.dropout_layer(x)  # [Batch, Seq, Dim]
 
-        # ---------------------------
-        # Path A: LSTM Forward
-        # ---------------------------
         lengths = (src != padding_idx).sum(dim=1).cpu()
         lengths = torch.clamp(lengths, min=1)
         packed_x = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
         packed_output, (h_n, c_n) = self.lstm(packed_x)
         lstm_feature = torch.cat([h_n[-2, :, :], h_n[-1, :, :]], dim=-1)
 
-        # ---------------------------
-        # Path B: Deep CNN Forward
-        # ---------------------------
-        # 变换维度适配 Conv1d: [Batch, Dim, Seq]
+
         x_permuted = x.permute(0, 2, 1)
 
         # 1. Stem Layer (Parallel)
         stem_outputs = []
         for conv in self.stem_convs:
-            # Conv -> ReLU. 注意这里暂时不 Pooling，保留序列长度以便堆叠
             out = F.relu(conv(x_permuted))
             stem_outputs.append(out)
 
-        # 拼接不同尺度的特征: [Batch, Filters*Kernels, Seq]
         cnn_feat = torch.cat(stem_outputs, dim=1)
 
-        # 2. Deep Layers (Stacked Residuals)
         for res_layer in self.deep_cnn_layers:
             cnn_feat = res_layer(cnn_feat)
 
-        # 3. Global Max Pooling (最后再做池化)
-        # cnn_feat shape: [Batch, Hidden, Seq] -> [Batch, Hidden]
+
         if cnn_feat.size(2) > 1:
             cnn_feat = F.max_pool1d(cnn_feat, kernel_size=cnn_feat.size(2)).squeeze(2)
         else:
             cnn_feat = cnn_feat.squeeze(2)
 
-        # 4. Projection
         cnn_feature_proj = self.cnn_project(cnn_feat)
 
-        # ---------------------------
-        # Path C: Gated Fusion
-        # ---------------------------
         gate_input = torch.cat([lstm_feature, cnn_feature_proj], dim=1)
         alpha = self.gate_net(gate_input)
         fused_vector = alpha * lstm_feature + (1 - alpha) * cnn_feature_proj
@@ -165,7 +130,6 @@ class DualEncoderModel(nn.Module):
         cnn_kernels = getattr(config, 'cnn_kernels', [3, 5, 7])
         cnn_num_layers = getattr(config, 'cnn_num_layers', 1)
 
-        # --- InChI Encoder ---
         self.inchi_encoder = HybridMoleculeEncoder(
             vocab_size=inchi_vocab_size,
             d_model=config.inchi_embed_dim,
@@ -176,7 +140,6 @@ class DualEncoderModel(nn.Module):
             cnn_num_layers=cnn_num_layers
         )
 
-        # --- SMILES Encoder ---
         self.smiles_encoder = HybridMoleculeEncoder(
             vocab_size=smiles_vocab_size,
             d_model=config.smiles_embed_dim,
@@ -187,7 +150,6 @@ class DualEncoderModel(nn.Module):
             cnn_num_layers=cnn_num_layers
         )
 
-        # Projection Heads (保持不变)
         self.inchi_proj = nn.Sequential(
             nn.Linear(config.inchi_embed_dim, config.inchi_embed_dim),
             nn.BatchNorm1d(config.inchi_embed_dim),
